@@ -1,4 +1,8 @@
 # Copyright [2018] [Phil Chen]
+# Copyright [2019] [Alicia Smith] * Added multiple inputs 
+# as well as codecommit source and lambda merge functionality
+# drawing from inspiration here:
+# https://github.com/tooltwist/codepipeline-artifact-munge
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +18,7 @@
 
 AWSTemplateFormatVersion: 2010-09-09
 
-Description: 'This solution allows you to create a AWS Codepipline for deploying a serverless application with AWS CodeBuild triggered by a Github repo commit. The setup of this solution is fully automated via a CloudFormation template.'
+Description: 'This solution allows you to create a AWS Codepipline for deploying a serverless application with AWS CodeBuild triggered by a CodeCommit or Github repo commit. The setup of this solution is fully automated via a CloudFormation template.'
 
 Parameters:
   Environment:
@@ -29,19 +33,149 @@ Parameters:
   CodePipelineBucketPrefix:
     Description: CodePipeline needs a utility bucket for its internal use. Specify a unique prefix for the bucket name
     Type: String
-    Default: codepipeline-work-
+    Default: codepipeline-test-
+  
+  CodeCommitRepository:
+    Description: "CodeCommit repository for config values"
+    Type: String
+    Default: cag-test-cc-repo
+    ConstraintDescription: "Can contain only ASCII characters."
 
+  CodeCommitRepositoryBranch:
+    Description: "The name of the branch for the CodeCommit repo"
+    Type: String
+    Default: master
+    ConstraintDescription: "Can contain only ASCII characters."
+    
   GitHubRepository:
     Type: String
-    Default: caggle/aws-serverless-code-pipeline-cf-template/master
+    Default: owner/repo/branch
     Description:  owner/repository/branch
 
   GitHubOAuthToken:
     Type: String
-    Default:  GitHub OAuthToken Here
+    Default:  GitHub OAuth Token Here
     Description:  CodePipeline requires an OAuthToken
 
 Resources:
+
+  S3:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      # BucketName: !Join [ "", [!Ref CodePipelineBucketPrefix,  "-", !Ref 'AWS::StackName', !Ref 'Environment', "-", !Ref "AWS::Region"]]
+      # I hardcoded the existing bucket created earlier here to make it easier
+      BucketName: "cag-codepipeline-ef-cfdev-us-west-2"  
+
+  MergeLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:
+       'Fn::Join': [ "", ["CodePipelineMergeLambda", "-", !Ref 'AWS::StackName', "-", !Ref 'Environment']]
+      Code:
+        # S3Bucket: !Join [ "", [!Ref CodePipelineBucketPrefix,  "-", !Ref 'AWS::StackName', !Ref 'Environment', "-", !Ref "AWS::Region"]]
+        S3Bucket: "cag-codepipeline-ef-cfdev-us-west-2"     # Again, hardcoded the bucket
+        S3Key: "CodepipelineArtifactMunge.zip"
+      Role: !GetAtt CodePipelineLambdaRole.Arn
+      Description: "Lambda Function to merge artifacts in CodePipeline"
+      Timeout: 30
+      Handler:  "merge.handler"
+      Runtime: "nodejs6.10"
+      MemorySize: 128
+    
+  CodePipelineLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        'Fn::Join': [ "", ["CodePipelineLambdaRole", "-", !Ref 'AWS::StackName', "-", !Ref 'Environment']]
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: "Allow"
+          Principal:
+            Service: "lambda.amazonaws.com"
+          Action: "sts:AssumeRole"
+
+  CodePipelineLambdaPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName:
+        'Fn::Join': [ "", ["CodePipelineLambdaPolicy", "-", !Ref 'AWS::StackName', "-", !Ref 'Environment']]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Resource: 
+            - !Sub arn:aws:s3:::${S3}
+            - !Sub arn:aws:s3:::${S3}/*
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:GetBucketVersioning
+          - Resource: "*"
+            Effect: Allow
+            Action:
+              - lambda:*
+              - codecommit:GetBranch
+              - codecommit:GetCommit
+              - codecommit:UploadArchive
+              - codecommit:GetUploadArchiveStatus
+              - codecommit:CancelUploadArchive
+              - codebuild:StartBuild
+              - codebuild:BatchGetBuilds
+              - cloudformation:*
+              - iam:PassRole
+              - codepipeline:PutJobSuccessResult
+              - codepipeline:PutJobFailureResult
+              - lambda:Listfunctions
+          - Resource: "*"
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+      Roles:
+        -  !Ref CodePipelineLambdaRole
+
+  CloudWatchCodeCommitEventRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName:
+        'Fn::Join': [ "", ["CloudWatchCodeCommitEventRole", "-", !Ref 'AWS::StackName', "-", !Ref 'Environment']]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+            Effect: "Allow"
+            Principal:
+              Service: "events.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: /
+
+  CloudWatchCodeCommitEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source: 
+          - aws.codecommit 
+        detail-type: 
+          - "CodeCommit Repository State Change" 
+        resources:
+          - !Join [ '', [ 'arn:aws:codecommit:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':', !Ref CodeCommitRepository ] ]
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - master
+      Targets:
+        -
+          Arn: 
+            !Join [ '', [ 'arn:aws:codepipeline:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':', !Ref Pipeline] ]
+          RoleArn: !GetAtt CloudWatchCodeCommitEventRole.Arn
+          Id: !Ref Pipeline
 
   CodeBuildRole:
     Type: "AWS::IAM::Role"
@@ -69,6 +203,20 @@ Resources:
             Service: "codepipeline.amazonaws.com"
           Action: "sts:AssumeRole"
 
+  CloudwatchCodeCommitEventPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName:
+        'Fn::Join': [ "", ["CloudwatchCodeCommitEventPolicy", "-", !Ref 'AWS::StackName', "-", !Ref 'Environment']]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Action: codepipeline:StartPipelineExecution
+          Resource: !Join [ '', [ 'arn:aws:codepipeline:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':', !Ref Pipeline] ]
+      Roles:
+        - !Ref CloudWatchCodeCommitEventRole
+
   # This can be restricted more
   CodeBuildPolicy:
     Type: "AWS::IAM::Policy"
@@ -80,16 +228,21 @@ Resources:
         Statement:
           Effect: Allow
           Action:
-            - logs:CreateLogGroup
-            - logs:CreateLogStream
-            - logs:PutLogEvents
-            - logs:DescribeLogGroups
-            - logs:FilterLogEvents
-            - logs:DescribeLogStreams
-            - logs:DeleteLogGroup
-            - s3:putObject
-            - s3:getObject
-            - codebuild:*
+            - 'logs:CreateLogGroup'
+            - 'logs:CreateLogStream'
+            - 'logs:PutLogEvents'
+            - 'logs:DescribeLogGroups'
+            - 'logs:FilterLogEvents'
+            - 'logs:DescribeLogStreams'
+            - 'logs:DeleteLogGroup'
+            - 's3:putObject'
+            - 's3:getObject'
+            - 'codebuild:*'
+            - 'codecommit:GetBranch'
+            - 'codecommit:GetCommit'
+            - 'codecommit:UploadArchive'
+            - 'codecommit:GetUploadArchiveStatus'
+            - 'codecommit:CancelUploadArchive'
             - 'cloudformation:List*'
             - 'cloudformation:Get*'
             - 'cloudformation:PreviewStackUpdate'
@@ -152,20 +305,21 @@ Resources:
             - s3:putObject
             - s3:getObject
             - codebuild:*
+            - codecommit:GetBranch
+            - codecommit:GetCommit
+            - codecommit:UploadArchive
+            - codecommit:GetUploadArchiveStatus
+            - codecommit:CancelUploadArchive
+            - lambda:InvokeFunction
           Resource:
             - "*"
       Roles:
         -  !Ref CodePipelineRole
 
-  S3:
-    Type: "AWS::S3::Bucket"
-    Properties:
-      BucketName: !Join [ "", [!Ref CodePipelineBucketPrefix, !Ref 'Environment', "-", !Ref "AWS::Region"]]
-
   TestBuild:
     Type: "AWS::CodeBuild::Project"
     Properties:
-      Name: Test-Build
+      Name: !Join ["", ["Test-Build",  "-", !Ref 'AWS::StackName'] ]
       Description: Demo of CodeBuild with CodeDeploy pipeline.
       ServiceRole: !Ref CodeBuildRole
       TimeoutInMinutes: 5
@@ -182,7 +336,7 @@ Resources:
   BuildDeploy:
     Type: "AWS::CodeBuild::Project"
     Properties:
-      Name: Build-Deploy
+      Name: !Join ["", ["Build-Deploy",  "-", !Ref 'AWS::StackName'] ]
       Description: Demo of CodeBuild with CodeDeploy pipeline.
       ServiceRole: !Ref CodeBuildRole
       TimeoutInMinutes: 5
@@ -217,10 +371,23 @@ Resources:
       RoleArn: !Join [ "", ["arn:aws:iam::", !Ref "AWS::AccountId", ":role/", !Ref CodePipelineRole  ] ]
       Stages:
 
-        # Stage 1:  Get the source from GitHub:
-        - Name: Source
+        # Stage 1:  Get both sources
+        - Name: DualSource
           Actions:
-            - Name: SourceAction
+            - Name: ConfigSource
+              RunOrder: 1
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: 1
+              Configuration:
+                BranchName: !Ref CodeCommitRepositoryBranch
+                RepositoryName: !Ref CodeCommitRepository
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: ConfigSourceOutput
+            - Name: CodeSource
               RunOrder: 1
               ActionTypeId:
                 Category: Source
@@ -234,15 +401,36 @@ Resources:
                 PollForSourceChanges: true
                 OAuthToken: !Ref GitHubOAuthToken
               OutputArtifacts:
-                - Name: TheSourceCode
+                - Name: CodeSourceOutput
 
-        # Stage 2:  Build using Serverless Framework
+        # Stage 2: Merge the Sources into one Artifact
+        # This merges the App and SecureConfig artifacts
+        # See https://dzone.com/articles/running-aws-lambda-functions-in-aws-codepipeline-u
+        - Name: Merge
+          Actions:
+            - Name: Merge-App-and-Config
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Version: 1
+                Provider: Lambda
+              Configuration:
+                FunctionName: !Ref MergeLambda
+                UserParameters: "config"
+              InputArtifacts:
+                - Name: CodeSourceOutput
+                - Name: ConfigSourceOutput
+              OutputArtifacts:
+                - Name: Build-Ready
+              RunOrder: 2
+  
+        # Stage 3:  Build using Serverless Framework
         - Name: TestBuild
           Actions:
-            - Name: Test-Build
-              RunOrder: 2
+            - Name: !Join [ "", ["TestBuild",  "-", !Ref 'AWS::StackName'] ]
+              RunOrder: 3
               InputArtifacts:
-                - Name: TheSourceCode
+                - Name: Build-Ready
               ActionTypeId:
                 Category: Build
                 Owner: AWS
@@ -250,16 +438,17 @@ Resources:
                 Version: 1
               Configuration:
                 ProjectName:  !Ref TestBuild
+                PrimarySource: CodeSource
               OutputArtifacts:
-                - Name: TheArtifact
+                - Name: Deploy-Ready
 
-        # Stage 3:  Build and Deploy using Serverless Framework
+        # Stage 4:  Build and Deploy using Serverless Framework
         - Name: BuildDeploy
           Actions:
-            - Name: Build-Deploy
-              RunOrder: 3
+            - Name: !Join ["", ["BuildDeploy",  "-", !Ref 'AWS::StackName'] ]
+              RunOrder: 4
               InputArtifacts:
-                - Name: TheArtifact
+                - Name: Deploy-Ready
               ActionTypeId:
                 Category: Build
                 Owner: AWS
@@ -268,14 +457,18 @@ Resources:
               Configuration:
                 ProjectName:  !Ref BuildDeploy
               OutputArtifacts:
-                - Name: TheArtifact2
+                - Name: Deploy-App
 
 Outputs:
   CodeBuild:
     Value: !Ref Pipeline
   Environment:
     Value: !Ref Environment
-  Github:
+  CodecommitRepo:
+    Value: !Ref CodeCommitRepository
+  CodecommitBranch:
+    Value: !Ref CodeCommitRepositoryBranch
+  GithubRepo:
     Value: !Ref GitHubRepository
   CodeBuildRole:
     Value: !Ref CodeBuildRole
@@ -283,7 +476,11 @@ Outputs:
     Value: !Ref CodeBuildPolicy
   CodePipelineRole:
     Value: !Ref CodePipelineRole
+  CodePipelineLambdaRole:
+    Value: !Ref CodePipelineLambdaRole
   CodePipelinePolicy:
     Value: !Ref CodePipelinePolicy
+  CodePipelineLambdaPolicy:
+    Value: !Ref CodePipelineLambdaPolicy
   S3:
     Value: !Ref S3
